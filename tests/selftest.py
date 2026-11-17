@@ -13,6 +13,15 @@
   S9  接收端不可用 → 待核且不虚报成功（--lifecycle）
   S10 发送端重启（接收端停机中）→ 待核持久 → 恢复后凭回执补核（--lifecycle）
   S11 发送端重启（接收端正常）→ 启动自动核对凭回执结案（--lifecycle）
+  W1  撤回先完成 → 旧发送被拒、同键重试不得入账、接收端永久保留撤回决定
+  W2  入账先完成 → 撤回拒绝并显示原回执，接收端不产生撤回决定
+  W3  撤回与入账并发交错（真实在途请求）→ 两端结论一致，仅一方生效
+  W4  撤回超时/丢回执 → 撤回待定，期间禁止再次发送；核对补回已撤回
+  W5  迟到的核对/发送响应不得改写最终结论
+  W6  撤回先提交后，迟到的旧发送请求到达 → 拒绝入账
+  W7  撤回决定对同键（同内容/异内容）重试永久生效，重复撤回幂等
+  W8  接收端重启后撤回决定仍永久生效（--lifecycle）
+  W9  撤回待定 + 接收端失联 + 发送端重启 → 待定不丢、禁止发送、恢复后结案（--lifecycle）
 
 用法：
   python3 tests/selftest.py [--lifecycle]
@@ -76,8 +85,31 @@ def sender_send(nid, simulate=None):
     return req("POST", url)
 
 
-def sender_reconcile(nid):
-    return req("POST", f"{SENDER}/api/notifications/{nid}/reconcile")
+def sender_reconcile(nid, simulate=None):
+    url = f"{SENDER}/api/notifications/{nid}/reconcile"
+    if simulate:
+        url += f"?simulate={simulate}"
+    return req("POST", url)
+
+
+def sender_withdraw(nid, simulate=None):
+    url = f"{SENDER}/api/notifications/{nid}/withdraw"
+    if simulate:
+        url += f"?simulate={simulate}"
+    return req("POST", url)
+
+
+def sender_recover(nid):
+    return req("POST", f"{SENDER}/api/notifications/{nid}/recover")
+
+
+def receiver_state(rel):
+    return req("GET", f"{RECEIVER}/api/state?env={ENV}&release_no={rel}", timeout=20)
+
+
+def receiver_withdrawals(rel):
+    _, d = req("GET", RECEIVER + "/api/withdrawals")
+    return [x for x in d.get("items", []) if x["env"] == ENV and x["release_no"] == rel]
 
 
 def sender_rows(rel):
@@ -97,6 +129,8 @@ def hook(env_var, default_cmd):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if r.returncode != 0:
         print(f"  !! 钩子返回码 {r.returncode}", flush=True)
+    # 重启/停机后给服务留出就绪与端口释放时间，避免把冷启动延迟误判为业务结论
+    time.sleep(float(os.environ.get("RN_HOOK_SETTLE", "2")))
 
 
 def wait_up(base, tries=60):
@@ -295,12 +329,363 @@ def s11_auto_reconcile_after_restart():
     check("S11 接收端仍仅一条", len(receiver_rows(k)) == 1)
 
 
+def s11_auto_reconcile_after_restart():
+    k = key("k11")
+    code, n = sender_create(ENV, k, "success")
+    nid = n["id"]
+    sender_send(nid, simulate="lose_response")
+    check("S11 重启前为待核", sender_rows(k)[0]["status"] == "UNCERTAIN")
+    hook("RN_HOOK_RESTART_SENDER", "docker compose restart sender")
+    if not wait_up(SENDER):
+        check("S11 发送端重启后恢复服务", False)
+        return
+    final = None
+    for _ in range(20):  # 启动核对线程约 2s 后触发
+        rows = sender_rows(k)
+        if rows and rows[0]["status"] == "ACKED":
+            final = rows[0]
+            break
+        time.sleep(0.5)
+    check("S11 重启后自动凭接收端回执结案", final is not None, f"{sender_rows(k)}")
+    check("S11 接收端仍仅一条", len(receiver_rows(k)) == 1)
+
+
+# ---------------- 撤回场景 ----------------
+
+def new_pending(tag):
+    k = key(tag)
+    code, n = sender_create(ENV, k, "success")
+    assert code in (200, 201), (code, n)
+    return k, n["id"]
+
+
+def w1_withdraw_before_send():
+    k, nid = new_pending("w1")
+    code, n = sender_withdraw(nid)
+    check("W1 撤回成功且结案为已撤回",
+          code == 200 and n.get("status") == "WITHDRAWN" and n.get("decision") == "WITHDRAWN", f"{code} {n}")
+    check("W1 接收端永久保留撤回决定", len(receiver_withdrawals(k)) == 1, f"{receiver_withdrawals(k)}")
+
+    code, n2 = sender_send(nid)
+    check("W1 撤回后旧发送被拒（不得入账）",
+          code == 409 and n2.get("kind") == "withdrawn" and not n2.get("receipt_id"), f"{code} {n2}")
+    check("W1 接收端仍无回执", len(receiver_rows(k)) == 0, f"{receiver_rows(k)}")
+
+    code, direct = req("POST", RECEIVER + "/api/receipts", {"env": ENV, "release_no": k, "result": "success"})
+    check("W1 接收端直连同键重试被拒（kind=withdrawal）",
+          code == 409 and direct.get("kind") == "withdrawal", f"{code} {direct}")
+    code, other = req("POST", RECEIVER + "/api/receipts", {"env": ENV, "release_no": k, "result": "failed"})
+    check("W1 接收端直连同键异内容同样被撤回拒绝",
+          code == 409 and other.get("kind") == "withdrawal", f"{code} {other}")
+    check("W1 接收端仍无任何回执", len(receiver_rows(k)) == 0, f"{receiver_rows(k)}")
+    state, snap = receiver_state(k)
+    check("W1 单键快照为 WITHDRAWN 且无回执",
+          state == 200 and snap.get("state") == "WITHDRAWN" and snap.get("receipt") is None, f"{snap}")
+
+
+def w2_booking_first_blocks_withdraw():
+    k, nid = new_pending("w2")
+    code, n = sender_send(nid)
+    check("W2 先入账成功", n.get("status") == "ACKED" and bool(n.get("receipt_id")), f"{n}")
+    receipt_id = n.get("receipt_id")
+    code, n2 = sender_withdraw(nid)
+    check("W2 撤回未生效并显示原回执",
+          code == 409 and n2.get("kind") == "receipt" and n2.get("status") == "ACKED"
+          and n2.get("receipt_id") == receipt_id, f"{code} {n2}")
+    check("W2 接收端不产生撤回决定", len(receiver_withdrawals(k)) == 0, f"{receiver_withdrawals(k)}")
+    check("W2 接收端仍仅一条回执", len(receiver_rows(k)) == 1, f"{receiver_rows(k)}")
+    code, direct = req("POST", RECEIVER + "/api/withdrawals",
+                       {"env": ENV, "release_no": k, "result": "success"})
+    check("W2 接收端直连撤回同样返回原回执且不入撤回表",
+          code == 409 and direct.get("kind") == "receipt"
+          and (direct.get("existing") or {}).get("id") == receipt_id
+          and len(receiver_withdrawals(k)) == 0, f"{code} {direct}")
+
+
+def w3_interleaved_booking_vs_withdraw():
+    """真实两路并发：入账请求先等 1.5s 再提交，撤回请求立即提交 → 撤回胜。"""
+    k, nid = new_pending("w3a")
+    results = {}
+
+    def do_book():
+        results["send"] = sender_send(nid, simulate="delay_before_commit")
+
+    t = threading.Thread(target=do_book)
+    t.start()
+    time.sleep(0.3)                     # 让入账请求先“在途”
+    code_w, w = sender_withdraw(nid)    # 撤回立刻提交
+    t.join()
+    code_s, s = results["send"]
+    check("W3 撤回先提交：撤回生效",
+          code_w == 200 and w.get("decision") == "WITHDRAWN", f"{code_w} {w}")
+    check("W3 在途的旧发送不得入账（最终仍为已撤回）",
+          code_s == 200 and s.get("decision") == "WITHDRAWN" and not s.get("receipt_id"), f"{code_s} {s}")
+    check("W3 接收端无回执、有撤回决定",
+          len(receiver_rows(k)) == 0 and len(receiver_withdrawals(k)) == 1,
+          f"{receiver_rows(k)} {receiver_withdrawals(k)}")
+
+    """反向（接收端层真实交错）：撤回请求在途 1.5s，期间入账请求立即提交 → 入账胜。"""
+    k2 = key("w3b")
+    out2 = {}
+
+    def slow_withdrawal():
+        out2["withdraw"] = req("POST", RECEIVER + "/api/withdrawals",
+                               {"env": ENV, "release_no": k2, "result": "success",
+                                "simulate": "delay_before_commit"})
+
+    t2 = threading.Thread(target=slow_withdrawal)
+    t2.start()
+    time.sleep(0.3)
+    code_s2, s2 = req("POST", RECEIVER + "/api/receipts",
+                      {"env": ENV, "release_no": k2, "result": "success"})
+    t2.join()
+    code_w2, w2 = out2["withdraw"]
+    check("W3 入账先提交：回执成功入账",
+          code_s2 == 201 and s2.get("content_hash"), f"{code_s2} {s2}")
+    check("W3 在途撤回不得报成功且返回原回执",
+          code_w2 == 409 and w2.get("kind") == "receipt"
+          and (w2.get("existing") or {}).get("id") == s2.get("id"), f"{code_w2} {w2}")
+    check("W3 接收端仅一条回执、无撤回决定",
+          len(receiver_rows(k2)) == 1 and len(receiver_withdrawals(k2)) == 0,
+          f"{receiver_rows(k2)} {receiver_withdrawals(k2)}")
+
+
+def w4_withdraw_uncertain_then_reconcile():
+    k, nid = new_pending("w4")
+    code, w = sender_withdraw(nid, simulate="slow")
+    check("W4 撤回回执超时 → 撤回待定，不报成功",
+          w.get("status") == "WITHDRAWING" and w.get("decision") is None, f"{code} {w}")
+    check("W4 接收端其实已保留撤回决定", len(receiver_withdrawals(k)) == 1, f"{receiver_withdrawals(k)}")
+
+    code, s = sender_send(nid)
+    check("W4 撤回待定期间禁止再次发送",
+          code == 409 and s.get("kind") == "withdrawing", f"{code} {s}")
+    check("W4 禁止发送后接收端仍无回执", len(receiver_rows(k)) == 0)
+
+    code, rec = sender_reconcile(nid)
+    check("W4 核对补回已撤回结论",
+          code == 200 and rec.get("status") == "WITHDRAWN" and rec.get("decision") == "WITHDRAWN", f"{rec}")
+    check("W4 接收端无回执", len(receiver_rows(k)) == 0)
+
+    # 撤回丢失回执（接收端已提交）也保持待定，重试撤回幂等结案
+    k2, nid2 = new_pending("w4b")
+    code, w2 = sender_withdraw(nid2, simulate="lose_response")
+    check("W4 撤回丢响应 → 撤回待定",
+          w2.get("status") == "WITHDRAWING" and w2.get("decision") is None, f"{code} {w2}")
+    code, w3 = sender_withdraw(nid2, simulate="lose_response")
+    check("W4 再次丢失仍待定（不臆断）",
+          w3.get("status") == "WITHDRAWING" and w3.get("decision") is None, f"{code} {w3}")
+    check("W4 重试撤回在接收端幂等，仍只一条撤回决定", len(receiver_withdrawals(k2)) == 1)
+    code, w4 = sender_withdraw(nid2)
+    check("W4 重试撤回拿到回执后结案",
+          code == 200 and w4.get("decision") == "WITHDRAWN", f"{code} {w4}")
+
+
+def w5_late_reconcile_cannot_rewrite():
+    """核对响应迟到：快照读到旧状态，期间另一动作已结案 → 迟到响应不得改写。
+
+    用接收端直连制造“发送在途/结果未知”：发送端刚把状态置为待核，
+    接收端则用 delay_before_commit 保持无记录；期间完成撤回。
+    """
+    k, nid = new_pending("w5")
+    out = {}
+
+    def slow_send():
+        # 接收端 1.5s 后才提交；发送端在此期间为待核（结果未知）
+        out["send"] = sender_send(nid, simulate="delay_before_commit")
+
+    t = threading.Thread(target=slow_send)
+    t.start()
+    time.sleep(0.3)  # 发送端已落“待核”，接收端尚未提交
+    rows = sender_rows(k)
+    check("W5 发送在途时本地为待核", bool(rows) and rows[0]["status"] == "UNCERTAIN", f"{rows}")
+
+    rec_out = {}
+
+    def slow_reconcile():
+        rec_out["rec"] = sender_reconcile(nid, simulate="delay")  # 快照=无记录，2s 后返回
+
+    tr = threading.Thread(target=slow_reconcile)
+    tr.start()
+    time.sleep(0.4)
+    code_w, w = sender_withdraw(nid)  # 此时接收端仍无记录 → 撤回提交
+    t.join()
+    tr.join()
+    code_s, s = out["send"]
+    code_r, r = rec_out["rec"]
+    check("W5 并发期间撤回已结案",
+          code_w == 200 and w.get("decision") == "WITHDRAWN", f"{code_w} {w}")
+    check("W5 迟到的发送响应不改写已撤回结论",
+          s.get("decision") == "WITHDRAWN" and not s.get("receipt_id"), f"{code_s} {s}")
+    check("W5 迟到的核对响应不改写已撤回结论",
+          r.get("status") == "WITHDRAWN" and r.get("decision") == "WITHDRAWN", f"{code_r} {r}")
+    check("W5 接收端仍无回执且有一条撤回决定",
+          len(receiver_rows(k)) == 0 and len(receiver_withdrawals(k)) == 1,
+          f"{receiver_rows(k)} {receiver_withdrawals(k)}")
+
+    # 已确认的记录，任何迟到核对同样不改写
+    k2, nid2 = new_pending("w5b")
+    sender_send(nid2)
+    code_r2, r2 = sender_reconcile(nid2, simulate="delay")
+    check("W5 已入账记录核对只返回原回执结论",
+          code_r2 == 200 and r2.get("decision") == "BOOKED" and r2.get("receipt_id"), f"{r2}")
+
+
+def w6_late_send_after_withdraw_commit():
+    """旧发送请求先发出（在途），撤回随后提交；在途发送到达时接收端必须拒绝入账。"""
+    k, nid = new_pending("w6")
+    out = {}
+
+    def slow_send():
+        out["send"] = sender_send(nid, simulate="delay_before_commit")  # 1.5s 后才提交
+
+    t = threading.Thread(target=slow_send)
+    t.start()
+    time.sleep(0.2)
+    code_w, w = sender_withdraw(nid)
+    t.join()
+    code_s, s = out["send"]
+    check("W6 撤回先完成", code_w == 200 and w.get("decision") == "WITHDRAWN", f"{w}")
+    check("W6 迟到的发送响应不得把结论改成已入账",
+          s.get("decision") == "WITHDRAWN" and not s.get("receipt_id"), f"{s}")
+    check("W6 接收端: 无回执 + 撤回决定永久保留",
+          len(receiver_rows(k)) == 0 and len(receiver_withdrawals(k)) == 1)
+    state, snap = receiver_state(k)
+    check("W6 单键快照仍为 WITHDRAWN", snap.get("state") == "WITHDRAWN", f"{snap}")
+
+
+def w7_withdrawal_permanent_and_idempotent():
+    k, nid = new_pending("w7")
+    sender_withdraw(nid)
+    code, dup = sender_create(ENV, k, "success")
+    check("W7 撤回后同键同内容登记仍幂等返回原记录",
+          code == 200 and dup.get("deduplicated") is True and dup.get("decision") == "WITHDRAWN", f"{code} {dup}")
+    code, other = sender_create(ENV, k, "failed")
+    check("W7 撤回后同键异内容仍 409（不因撤回而放开）", code == 409, f"{code} {other}")
+    code, w2 = sender_withdraw(nid)
+    check("W7 重复撤回幂等（已生效）", code == 200 and w2.get("decision") == "WITHDRAWN", f"{code} {w2}")
+    code, direct = req("POST", RECEIVER + "/api/withdrawals",
+                       {"env": ENV, "release_no": k, "result": "success"})
+    check("W7 接收端重复撤回幂等（deduplicated）",
+          code == 200 and direct.get("deduplicated") is True, f"{code} {direct}")
+    code, conflict = req("POST", RECEIVER + "/api/withdrawals",
+                         {"env": ENV, "release_no": k, "result": "failed"})
+    check("W7 撤回决定异内容 409", code == 409, f"{code} {conflict}")
+    check("W7 撤回决定未被改写", len(receiver_withdrawals(k)) == 1)
+    code, after = sender_send(nid)
+    check("W7 撤回后发送仍被拒", code == 409 and after.get("kind") == "withdrawn", f"{code} {after}")
+    check("W7 最终无回执", len(receiver_rows(k)) == 0)
+
+
+def w8_receiver_restart_keeps_withdrawal():
+    k, nid = new_pending("w8")
+    code, w = sender_withdraw(nid)
+    check("W8 重启前撤回生效", code == 200 and w.get("decision") == "WITHDRAWN", f"{w}")
+    hook("RN_HOOK_RESTART_RECEIVER", "docker compose restart receiver")
+    if not wait_up(RECEIVER):
+        check("W8 接收端重启后恢复服务", False)
+        return
+    check("W8 重启后撤回决定仍永久保留", len(receiver_withdrawals(k)) == 1)
+    code, direct = req("POST", RECEIVER + "/api/receipts", {"env": ENV, "release_no": k, "result": "success"})
+    check("W8 重启后同键发送仍被拒", code == 409 and direct.get("kind") == "withdrawal", f"{code} {direct}")
+    check("W8 重启后仍无回执", len(receiver_rows(k)) == 0)
+
+
+def w9_withdraw_uncertain_survives_restart():
+    k, nid = new_pending("w9")
+    hook("RN_HOOK_STOP_RECEIVER", "docker compose stop receiver")
+    time.sleep(1)
+    code, w = sender_withdraw(nid)
+    check("W9 接收端失联 → 撤回待定",
+          w.get("status") == "WITHDRAWING" and w.get("decision") is None, f"{code} {w}")
+    code, rec = sender_reconcile(nid)
+    check("W9 失联时核对仍保持待定", rec.get("status") == "WITHDRAWING", f"{rec}")
+    code, s = sender_send(nid)
+    check("W9 待定期间禁止再次发送", code == 409 and s.get("kind") == "withdrawing", f"{code} {s}")
+
+    hook("RN_HOOK_RESTART_SENDER", "docker compose restart sender")
+    if not wait_up(SENDER):
+        check("W9 发送端重启后恢复服务", False)
+        return
+    time.sleep(3)
+    rows = sender_rows(k)
+    check("W9 重启后撤回待定仍在（未丢未虚报）",
+          bool(rows) and rows[0]["status"] == "WITHDRAWING" and rows[0]["decision"] is None, f"{rows}")
+    code, s2 = sender_send(nid)
+    check("W9 重启后待定期间仍禁止发送", code == 409 and s2.get("kind") == "withdrawing", f"{code} {s2}")
+
+    hook("RN_HOOK_START_RECEIVER", "docker compose start receiver")
+    if not wait_up(RECEIVER):
+        check("W9 接收端恢复", False)
+        return
+    code, w2 = sender_withdraw(nid)
+    check("W9 恢复后重试撤回结案",
+          code == 200 and w2.get("decision") == "WITHDRAWN", f"{code} {w2}")
+    check("W9 接收端仅一条撤回决定、无回执",
+          len(receiver_withdrawals(k)) == 1 and len(receiver_rows(k)) == 0)
+
+    # 反向：接收端已有入账但发送端尚未知悉（丢回执→待核），失联期间撤回待定；
+    # 恢复后核对/重试撤回必须显示原回执，绝不报撤回成功
+    k2, nid2 = new_pending("w9b")
+    sender_send(nid2, simulate="lose_response")  # 接收端已入账，发送端待核
+    hook("RN_HOOK_STOP_RECEIVER", "docker compose stop receiver")
+    time.sleep(1)
+    code, w3 = sender_withdraw(nid2)
+    check("W9 已入账后接收端失联，撤回仍待定", w3.get("status") == "WITHDRAWING", f"{w3}")
+    hook("RN_HOOK_START_RECEIVER", "docker compose start receiver")
+    if not wait_up(RECEIVER):
+        check("W9 接收端再次恢复", False)
+        return
+    code, rec2 = sender_reconcile(nid2)
+    check("W9 恢复后核对显示原回执、撤回未生效",
+          rec2.get("status") == "ACKED" and rec2.get("decision") == "BOOKED" and rec2.get("receipt_id"),
+          f"{rec2}")
+    check("W9 接收端仍无撤回决定", len(receiver_withdrawals(k2)) == 0)
+
+
+def w10_recover_gate():
+    """安全重发前必须用接收端快照显式核实；核实前发送端不得臆断“未送达”。"""
+    k, nid = new_pending("w10")
+    code, s = sender_send(nid, simulate="fail_before_commit")
+    check("W10 接收端提交前失败 → 待核而非成功", s.get("status") == "UNCERTAIN", f"{code} {s}")
+    check("W10 接收端确无记录", receiver_state(k)[1].get("state") == "NONE")
+    code, r = sender_recover(nid)
+    check("W10 核实后恢复待发送", code == 200 and r.get("status") == "PENDING", f"{code} {r}")
+    code, s2 = sender_send(nid)
+    check("W10 恢复后发送成功入账", code == 200 and s2.get("decision") == "BOOKED", f"{code} {s2}")
+    code, r2 = sender_recover(nid)
+    check("W10 已结案后核实被拒（不改写结论）", code == 409, f"{code} {r2}")
+
+    # 撤回待定时不允许“恢复发送”
+    k2, nid2 = new_pending("w10b")
+    sender_withdraw(nid2, simulate="lose_response")
+    code, r3 = sender_recover(nid2)
+    check("W10 撤回待定时核实不恢复发送", code == 409 and r3.get("kind") == "withdrawing", f"{code} {r3}")
+
+
+def w11_double_withdraw_attempts_bounded_by_receiver():
+    """多次撤回尝试只会留下一条永久决定，且时间戳不被后续尝试改写。"""
+    k, nid = new_pending("w11")
+    code, w = sender_withdraw(nid)
+    _, first = receiver_state(k)
+    stamp = first["withdrawal"]["withdrawn_at"]
+    for _ in range(3):
+        sender_withdraw(nid)
+    _, later = receiver_state(k)
+    check("W11 重复撤回不新增决定", len(receiver_withdrawals(k)) == 1)
+    check("W11 首次撤回时间未被改写", later["withdrawal"]["withdrawn_at"] == stamp,
+          f"{stamp} vs {later['withdrawal']['withdrawn_at']}")
+
+
 def main():
     lifecycle = "--lifecycle" in sys.argv or os.environ.get("RN_LIFECYCLE") == "1"
     print(f"发送端 {SENDER}  接收端 {RECEIVER}  lifecycle={lifecycle}", flush=True)
     if not wait_up(SENDER) or not wait_up(RECEIVER):
         print("服务未就绪，请先启动两端。")
         sys.exit(2)
+    # 发送端启动后会异步核对一次（约 2s 后）。等它结束再跑场景，
+    # 否则“慢回执→待核”等断言会被启动核对抢先结案而变得不确定。
+    time.sleep(float(os.environ.get("RN_STARTUP_SETTLE", "4")))
 
     s1_basic()
     s2_retry_dedup()
@@ -310,10 +695,21 @@ def main():
     s6_slow_response()
     s7_concurrent_same()
     s8_concurrent_diff()
+    w1_withdraw_before_send()
+    w2_booking_first_blocks_withdraw()
+    w3_interleaved_booking_vs_withdraw()
+    w4_withdraw_uncertain_then_reconcile()
+    w5_late_reconcile_cannot_rewrite()
+    w6_late_send_after_withdraw_commit()
+    w7_withdrawal_permanent_and_idempotent()
+    w10_recover_gate()
+    w11_double_withdraw_attempts_bounded_by_receiver()
     if lifecycle:
         nid_k9 = s9_receiver_down()
         s10_sender_restart_while_down(nid_k9)
         s11_auto_reconcile_after_restart()
+        w8_receiver_restart_keeps_withdrawal()
+        w9_withdraw_uncertain_survives_restart()
 
     print(f"\n通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
     if FAILED:

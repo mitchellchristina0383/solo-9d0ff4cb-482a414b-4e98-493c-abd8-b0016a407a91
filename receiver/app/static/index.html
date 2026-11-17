@@ -11,43 +11,72 @@
   header p { margin: 4px 0 0; font-size: 12px; color: #cbd2d9; }
   main { max-width: 980px; margin: 20px auto; padding: 0 16px; }
   .card { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eef1f4; }
   th { color: #7b8794; font-weight: 600; }
   code { background: #eef1f4; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .muted { color: #9aa5b1; font-size: 12px; }
+  .empty { color: #9aa5b1; font-size: 13px; padding: 8px 0; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 9px; font-size: 12px; background: #ece3ff; color: #4c2a99; }
 </style>
 </head>
 <body>
 <header>
   <h1>审计接收端 · 回执台账</h1>
-  <p>相同「环境+发布号」的同内容重试只记一次；内容不同返回 409 冲突。本页每 3 秒自动刷新。</p>
+  <p>相同「环境+发布号」的同内容重试只记一次；内容不同返回 409 冲突。
+     撤回决定按「环境+发布号」永久保留：撤回先提交则该键永不入账，入账先提交则撤回请求返回原回执。本页每 3 秒自动刷新。</p>
 </header>
 <main>
   <section class="card">
+    <h2>已入账回执</h2>
     <p class="muted">
-      接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response"</code> 模拟入库后丢响应，
-      或 <code>"slow"</code> 模拟慢回执）· <code>GET /api/receipts?env=...&amp;release_no=...</code> 查询回执
+      接口：<code>POST /api/receipts</code>（body 可带 <code>"simulate":"lose_response" | "slow" | "delay" | "delay_before_commit"</code>）·
+      <code>GET /api/receipts?env=...&amp;release_no=...</code> ·
+      <code>POST /api/withdrawals</code> 撤回 ·
+      <code>GET /api/state?env=...&amp;release_no=...</code> 单键一致快照
     </p>
     <table>
       <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>入账时间 (UTC)</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
+    <div class="empty" id="empty-receipts" style="display:none">暂无入账记录</div>
+  </section>
+
+  <section class="card">
+    <h2>撤回决定 <span class="tag">永久</span></h2>
+    <p class="muted">撤回与入账互斥，谁先提交谁生效；此处记录一经写入不会被删除或改写。</p>
+    <table>
+      <thead><tr><th>ID</th><th>环境</th><th>发布号</th><th>原结果</th><th>撤回时间 (UTC)</th></tr></thead>
+      <tbody id="wrows"></tbody>
+    </table>
+    <div class="empty" id="empty-withdrawals" style="display:none">暂无撤回决定</div>
   </section>
 </main>
 <script>
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
 async function load() {
-  const r = await fetch("/api/receipts");
-  const data = await r.json();
+  const [r, w] = await Promise.all([fetch("/api/receipts"), fetch("/api/withdrawals")]);
+  const rdata = await r.json();
+  const wdata = await w.json();
   const tbody = document.getElementById("rows");
   tbody.innerHTML = "";
-  for (const n of (data.items || [])) {
+  for (const n of (rdata.items || [])) {
     const tr = document.createElement("tr");
     tr.innerHTML = "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
       "</td><td>" + esc(n.result) + "</td><td class='muted'>" + esc(n.received_at) + "</td>";
     tbody.appendChild(tr);
   }
+  document.getElementById("empty-receipts").style.display = (rdata.items || []).length ? "none" : "block";
+  const wtbody = document.getElementById("wrows");
+  wtbody.innerHTML = "";
+  for (const n of (wdata.items || [])) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) +
+      "</td><td>" + esc(n.result) + "</td><td class='muted'>" + esc(n.withdrawn_at) + "</td>";
+    wtbody.appendChild(tr);
+  }
+  document.getElementById("empty-withdrawals").style.display = (wdata.items || []).length ? "none" : "block";
 }
 load();
 setInterval(load, 3000);

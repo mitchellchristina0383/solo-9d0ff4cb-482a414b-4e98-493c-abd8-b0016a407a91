@@ -14,25 +14,54 @@ DATA_DIR="${DATA_DIR:-/tmp/rn-data}"
 LOG_DIR="${LOG_DIR:-/tmp/rn-logs}"
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 
+wait_port_free() {  # $1=端口：等旧进程真正释放端口，避免新旧进程叠加导致端口串扰
+  local port="$1"
+  for _ in $(seq 1 20); do
+    if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then return 0; fi
+    exec 3>&- 2>/dev/null || true
+    sleep 0.3
+  done
+  return 0
+}
+
+wait_healthy() {  # $1=端口：等新进程开始服务
+  local port="$1" code
+  for _ in $(seq 1 40); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' -m 2 "http://127.0.0.1:$port/api/health" || true)"
+    [ "$code" = "200" ] && return 0
+    sleep 0.3
+  done
+  return 1
+}
+
 start_receiver() {
   DB_PATH="$DATA_DIR/receiver.db" nohup "$PY" -m uvicorn app.main:app \
     --host 127.0.0.1 --port 8001 --app-dir "$ROOT/receiver" \
     >>"$LOG_DIR/receiver.log" 2>&1 &
+  wait_healthy 8001
 }
 start_sender() {
   DB_PATH="$DATA_DIR/sender.db" RECEIVER_URL="http://127.0.0.1:8001" \
     nohup "$PY" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --app-dir "$ROOT/sender" \
     >>"$LOG_DIR/sender.log" 2>&1 &
+  wait_healthy 8000
 }
-stop_receiver() { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8001" 2>/dev/null || true; }
-stop_sender()   { pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000" 2>/dev/null || true; }
+stop_receiver() {
+  pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8001" 2>/dev/null || true
+  wait_port_free 8001
+}
+stop_sender() {
+  pkill -f "uvicorn app.main:app --host 127.0.0.1 --port 8000" 2>/dev/null || true
+  wait_port_free 8000
+}
 
 case "${1:-}" in
   start-all) start_receiver; start_sender ;;
   stop-all) stop_receiver; stop_sender ;;
   stop-receiver) stop_receiver ;;
   start-receiver) start_receiver ;;
-  restart-sender) stop_sender; sleep 1; start_sender ;;
+  restart-sender) stop_sender; start_sender ;;
+  restart-receiver) stop_receiver; start_receiver ;;
   clean) stop_receiver; stop_sender; rm -rf "$DATA_DIR" ;;
   test)
     "$0" stop-all || true
@@ -41,8 +70,9 @@ case "${1:-}" in
     RN_LIFECYCLE=1 \
     RN_HOOK_STOP_RECEIVER="$ROOT/tests/run_local.sh stop-receiver" \
     RN_HOOK_START_RECEIVER="$ROOT/tests/run_local.sh start-receiver" \
+    RN_HOOK_RESTART_RECEIVER="$ROOT/tests/run_local.sh restart-receiver" \
     RN_HOOK_RESTART_SENDER="$ROOT/tests/run_local.sh restart-sender" \
     python3 "$ROOT/tests/selftest.py" --lifecycle
     ;;
-  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|clean|test}"; exit 1 ;;
+  *) echo "用法: $0 {start-all|stop-all|stop-receiver|start-receiver|restart-sender|restart-receiver|clean|test}"; exit 1 ;;
 esac

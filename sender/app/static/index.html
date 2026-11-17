@@ -11,20 +11,24 @@
   header h1 { font-size: 18px; margin: 0; }
   header p { margin: 4px 0 0; font-size: 12px; color: #9aa5b1; }
   header a { color: #7fd1ff; }
-  main { max-width: 1100px; margin: 20px auto; padding: 0 16px; }
+  main { max-width: 1220px; margin: 20px auto; padding: 0 16px; }
   .card { background: #fff; border: 1px solid #e4e7eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 16px; }
   .card h2 { font-size: 15px; margin: 0 0 12px; }
   label { font-size: 13px; color: #52606d; display: block; margin-bottom: 10px; }
   input[type=text], select { width: 100%; padding: 7px 9px; border: 1px solid #cbd2d9; border-radius: 6px; font-size: 14px; margin-top: 3px; }
+  input[type=text]:disabled { background: #f0f2f4; color: #7b8794; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
   .row > label { flex: 1; min-width: 140px; }
   button { background: #0967d2; color: #fff; border: 0; border-radius: 6px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
   button.ghost { background: #e4e7eb; color: #1f2933; }
-  button.small { padding: 4px 10px; font-size: 12px; }
-  button:hover { filter: brightness(1.08); }
+  button.danger { background: #d64545; }
+  button.small { padding: 4px 10px; font-size: 12px; margin: 1px 0; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
   #msg { margin-top: 10px; font-size: 13px; padding: 8px 10px; border-radius: 6px; display: none; }
   #msg.ok { display: block; background: #e3f2e9; color: #1c7c43; }
   #msg.err { display: block; background: #fdecea; color: #c0392b; }
+  #msg.warn { display: block; background: #fff3cd; color: #8a6d1a; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #eef1f4; vertical-align: top; }
   th { color: #7b8794; font-weight: 600; white-space: nowrap; }
@@ -33,15 +37,24 @@
   .b-UNCERTAIN { background: #fff3cd; color: #8a6d1a; }
   .b-ACKED { background: #d9f2e3; color: #1c7c43; }
   .b-CONFLICT { background: #fdecea; color: #c0392b; }
+  .b-WITHDRAWING { background: #ffe8cc; color: #99470a; }
+  .b-WITHDRAWN { background: #ece3ff; color: #4c2a99; }
   .muted { color: #9aa5b1; font-size: 12px; }
-  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
   .err-text { color: #c0392b; font-size: 12px; max-width: 220px; word-break: break-all; }
+  .ops { display: flex; flex-direction: column; gap: 3px; min-width: 150px; }
+  .ops .line { display: flex; gap: 4px; flex-wrap: wrap; }
+  .verdict { font-size: 12px; font-weight: 600; }
+  .v-booked { color: #1c7c43; }
+  .v-withdrawn { color: #4c2a99; }
+  .v-none { color: #8a6d1a; }
 </style>
 </head>
 <body>
 <header>
   <h1>发布值班台 · 部署完成通知（发送端）</h1>
   <p>仅凭接收端回执确认送达；丢回执 / 接收端不可达 / 本端重启后保持「待核」，可核对补账，绝不虚报成功。
+     撤回为最终决定：撤回待定期间禁止再次发送；撤回先到则旧发送与同键重试均不得入账，入账先到则显示原回执。
      接收端台账：<a href="http://localhost:8001" target="_blank">http://localhost:8001</a></p>
 </header>
 <main>
@@ -58,12 +71,39 @@
             <option value="rolled_back">已回滚</option>
           </select>
         </label>
+        <label>故障演示
+          <select id="sim">
+            <option value="">无</option>
+            <option value="lose_response">入库后丢回执（待核）</option>
+            <option value="slow">慢回执 6s（发送端超时）</option>
+            <option value="delay">慢回执 2s（仍在内，可制造交错）</option>
+          </select>
+        </label>
       </div>
-      <label style="display:flex;align-items:center;gap:6px">
-        <input type="checkbox" id="sim"> 模拟接收端故障：入库后丢失响应（演示「待核 → 核对」流程）
-      </label>
       <button type="submit">提交并发送</button>
       <div id="msg"></div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>单条撤回</h2>
+    <form id="wform">
+      <div class="row">
+        <label>环境<input type="text" id="wenv" value="prod"></label>
+        <label>发布号<input type="text" id="wrel" placeholder="填写要撤回的发布号"></label>
+        <label>故障演示
+          <select id="wsim">
+            <option value="">无</option>
+            <option value="lose_response">提交后丢回执（撤回待定）</option>
+            <option value="slow">慢回执 6s（撤回待定）</option>
+            <option value="delay">慢回执 2s（可制造交错）</option>
+            <option value="delay_before_commit">提交前等待 1.5s（入库抢占演示）</option>
+            <option value="fail_before_commit">提交前失败 503（不改动任何记录）</option>
+          </select>
+        </label>
+      </div>
+      <button type="submit" class="danger">撤回该条通知</button>
+      <div id="wmsg"></div>
     </form>
   </section>
 
@@ -71,18 +111,22 @@
     <div class="toolbar">
       <h2 style="margin:0;flex:1">通知记录</h2>
       <button class="ghost small" id="btn-refresh">刷新</button>
-      <button class="ghost small" id="btn-reconcile-all">核对全部待核</button>
+      <button class="ghost small" id="btn-reconcile-all">核对全部未结案</button>
     </div>
     <table>
       <thead>
-        <tr><th>ID</th><th>环境</th><th>发布号</th><th>结果</th><th>状态</th><th>尝试</th><th>回执</th><th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th></tr>
+        <tr><th>ID</th><th>环境 / 发布号</th><th>结果</th><th>状态</th><th>撤回</th><th>回执 / 结论</th><th>尝试 / 撤回尝试</th><th>最近错误</th><th>更新时间 (UTC)</th><th>操作</th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
   </section>
 </main>
 <script>
-const STATUS_LABEL = { PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认", CONFLICT: "冲突" };
+const STATUS_LABEL = {
+  PENDING: "待发送", UNCERTAIN: "待核", ACKED: "已确认",
+  CONFLICT: "冲突", WITHDRAWING: "撤回待定", WITHDRAWN: "已撤回",
+};
+const WITHDRAW_LABEL = { WITHDRAWING: "进行中（待定）", WITHDRAWN: "已生效" };
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -91,18 +135,32 @@ async function api(path, opts) {
   return { status: r.status, data };
 }
 
-function showMsg(text, ok) {
-  const el = document.getElementById("msg");
+function showMsg(id, text, tone) {
+  const el = document.getElementById(id);
   el.textContent = text;
-  el.className = ok ? "ok" : "err";
+  el.className = tone;
+}
+
+function describe(d) {
+  if (d.kind === "withdrawing" || d.status === "WITHDRAWING") {
+    return [(d.note || "撤回结果待定") + "；" + (d.last_error || ""), "warn"];
+  }
+  if (d.kind === "withdrawn" || d.status === "WITHDRAWN") {
+    return [d.note || "该通知已撤回", "ok"];
+  }
+  if (d.kind === "receipt") {
+    return [(d.note || "该通知已入账") + "，" + (d.detail || d.last_error || ""), "err"];
+  }
+  if (d.status === "ACKED") return ["已确认入账（回执 #" + (d.receipt_id ?? "?") + "）", "ok"];
+  if (d.status === "CONFLICT") return ["冲突：" + (d.last_error || "内容不一致"), "err"];
+  if (d.status === "UNCERTAIN") return ["未拿到回执，状态=待核：" + (d.last_error || ""), "warn"];
+  return [(d.detail || d.note || "当前状态：" + (STATUS_LABEL[d.status] || d.status)), "ok"];
 }
 
 function report(d) {
-  if (!d || !d.status) { showMsg("操作失败", false); return; }
-  if (d.status === "ACKED") showMsg("已确认送达（回执 #" + (d.receipt_id ?? "?") + "）", true);
-  else if (d.status === "CONFLICT") showMsg("冲突：" + (d.last_error || "内容不一致"), false);
-  else if (d.status === "UNCERTAIN") showMsg("未拿到回执，状态=待核：" + (d.last_error || ""), false);
-  else showMsg((d.note ? d.note + "；" : "") + "当前状态：" + (STATUS_LABEL[d.status] || d.status), true);
+  if (!d || (!d.status && !d.detail)) { showMsg("msg", "操作失败", "err"); return; }
+  const [text, tone] = describe(d);
+  showMsg("msg", text, tone);
 }
 
 async function load() {
@@ -110,22 +168,53 @@ async function load() {
   const tbody = document.getElementById("rows");
   tbody.innerHTML = "";
   for (const n of (data.items || [])) {
+    const final = n.decision === "BOOKED" || n.decision === "WITHDRAWN";
     const tr = document.createElement("tr");
-    const receipt = n.receipt_id ? "#" + n.receipt_id : "—";
+    const verdict = n.decision === "BOOKED"
+      ? '<span class="verdict v-booked">入账在先 · 回执 #' + (n.receipt_id ?? "?") + "</span>"
+      : n.decision === "WITHDRAWN"
+        ? '<span class="verdict v-withdrawn">撤回在先 · 永久生效</span>'
+        : '<span class="verdict v-none">结论待定</span>';
+    const withdraw = n.status === "WITHDRAWN"
+      ? '<span class="verdict v-withdrawn">已生效</span>'
+      : n.status === "WITHDRAWING"
+        ? '<span class="verdict v-none">进行中（待定）</span>'
+        : n.withdraw_attempt_count
+          ? "已尝试 " + n.withdraw_attempt_count + " 次"
+          : "—";
     tr.innerHTML =
-      "<td>" + n.id + "</td><td>" + esc(n.env) + "</td><td>" + esc(n.release_no) + "</td>" +
+      "<td>" + n.id + "</td>" +
+      "<td>" + esc(n.env) + " / " + esc(n.release_no) + "</td>" +
       "<td>" + esc(n.result) + "</td>" +
       '<td><span class="badge b-' + n.status + '">' + (STATUS_LABEL[n.status] || n.status) + "</span></td>" +
-      "<td>" + n.attempt_count + "</td><td>" + receipt + "</td>" +
+      "<td>" + esc(withdraw) + "</td>" +
+      "<td>" + (n.receipt_id ? "#" + n.receipt_id : "—") + "<br>" + verdict + "</td>" +
+      "<td>" + n.attempt_count + " / " + n.withdraw_attempt_count + "</td>" +
       '<td class="err-text">' + esc(n.last_error || "") + "</td>" +
       '<td class="muted">' + esc(n.updated_at || "") + "</td>" +
-      '<td><button class="small" data-act="send">发送/重试</button> ' +
-      '<button class="small ghost" data-act="reconcile">核对</button></td>';
+      '<td><div class="ops"><div class="line">' +
+        '<button class="small" data-act="send">发送/重试</button>' +
+        '<button class="small ghost" data-act="reconcile">核对</button></div>' +
+        '<div class="line"><button class="small danger" data-act="withdraw">撤回</button>' +
+        '<button class="small ghost" data-act="recover">核实并恢复</button></div></div></td>';
+    tr.querySelector('[data-act="send"]').disabled = final || n.status === "WITHDRAWING";
+    tr.querySelector('[data-act="withdraw"]').disabled = final;
     tr.querySelector('[data-act="send"]').onclick = async () => {
       report((await api(`/api/notifications/${n.id}/send`, { method: "POST" })).data); load();
     };
+    tr.querySelector('[data-act="withdraw"]').onclick = async () => {
+      const w = await api(`/api/notifications/${n.id}/withdraw`, { method: "POST" });
+      const [text, tone] = describe(w.data);
+      showMsg("wmsg", text, tone); load();
+    };
     tr.querySelector('[data-act="reconcile"]').onclick = async () => {
       report((await api(`/api/notifications/${n.id}/reconcile`, { method: "POST" })).data); load();
+    };
+    tr.querySelector('[data-act="recover"]').onclick = async () => {
+      const r = await api(`/api/notifications/${n.id}/recover`, { method: "POST" });
+      const d = r.data;
+      const text = r.status === 200 ? (d.note || "已核对") : (d.detail || "仍待定");
+      showMsg("wmsg", text, r.status === 200 ? "ok" : "warn"); load();
     };
     tbody.appendChild(tr);
   }
@@ -143,11 +232,26 @@ document.getElementById("form").onsubmit = async (e) => {
   const c = await api("/api/notifications", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
-  if (c.status === 409) { showMsg("冲突：" + (c.data.detail || "已存在不同内容"), false); load(); return; }
-  if (c.status >= 400) { showMsg("登记失败：" + (c.data.detail || c.status), false); return; }
-  const sim = document.getElementById("sim").checked ? "?simulate=lose_response" : "";
-  const s = await api(`/api/notifications/${c.data.id}/send${sim}`, { method: "POST" });
+  if (c.status === 409) { showMsg("msg", "冲突：" + (c.data.detail || "已存在不同内容"), "err"); load(); return; }
+  if (c.status >= 400) { showMsg("msg", "登记失败：" + (c.data.detail || c.status), "err"); return; }
+  const sim = document.getElementById("sim").value;
+  const s = await api(`/api/notifications/${c.data.id}/send${sim ? "?simulate=" + sim : ""}`, { method: "POST" });
   report(s.data);
+  load();
+};
+
+document.getElementById("wform").onsubmit = async (e) => {
+  e.preventDefault();
+  const env = document.getElementById("wenv").value.trim();
+  const rel = document.getElementById("wrel").value.trim();
+  if (!rel) { showMsg("wmsg", "请填写要撤回的发布号", "err"); return; }
+  const list = (await api("/api/notifications")).data.items || [];
+  const target = list.find(x => x.env === env && x.release_no === rel);
+  if (!target) { showMsg("wmsg", "未找到该环境 + 发布号的本地登记", "err"); return; }
+  const sim = document.getElementById("wsim").value;
+  const r = await api(`/api/notifications/${target.id}/withdraw${sim ? "?simulate=" + sim : ""}`, { method: "POST" });
+  const [text, tone] = describe(r.data);
+  showMsg("wmsg", text, tone);
   load();
 };
 
